@@ -4,7 +4,6 @@ import { access, stat } from 'node:fs/promises'
 import { createServer } from 'node:http'
 import { extname, join, posix, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import nodemailer from 'nodemailer'
 import { createReviewsStore } from './reviewsStore.js'
 
 const ROOT_DIR = resolve(fileURLToPath(new URL('..', import.meta.url)))
@@ -74,6 +73,7 @@ const trustedOriginHosts = new Set(['mathislallemand.fr', 'www.mathislallemand.f
 
 const postRateLimitStore = new Map()
 let contactTransporter = null
+let nodemailerModulePromise = null
 const rateLimitSweepTimer = setInterval(() => {
   const now = Date.now()
   for (const [ip, entry] of postRateLimitStore.entries()) {
@@ -356,12 +356,30 @@ function escapeHtml(value) {
     .replaceAll("'", '&#39;')
 }
 
-function getContactTransporter() {
+async function loadNodemailerModule() {
+  if (!nodemailerModulePromise) {
+    nodemailerModulePromise = import('nodemailer').catch(() => null)
+  }
+
+  const moduleNamespace = await nodemailerModulePromise
+  if (!moduleNamespace) {
+    return null
+  }
+
+  return moduleNamespace.default || moduleNamespace
+}
+
+async function getContactTransporter() {
   if (contactTransporter) {
     return contactTransporter
   }
 
   if (!SMTP_HOST || !SMTP_USER || !SMTP_PASS || !CONTACT_FROM_EMAIL || !CONTACT_TO_EMAIL) {
+    return null
+  }
+
+  const nodemailer = await loadNodemailerModule()
+  if (!nodemailer) {
     return null
   }
 
@@ -379,7 +397,7 @@ function getContactTransporter() {
 }
 
 async function sendContactEmail(payload) {
-  const transporter = getContactTransporter()
+  const transporter = await getContactTransporter()
   if (!transporter) {
     return { ok: false, reason: 'not_configured' }
   }
