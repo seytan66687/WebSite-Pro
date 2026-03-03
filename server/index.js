@@ -4,6 +4,7 @@ import { access, stat } from 'node:fs/promises'
 import { createServer } from 'node:http'
 import { extname, join, posix, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import nodemailer from 'nodemailer'
 import { createReviewsStore } from './reviewsStore.js'
 
 const ROOT_DIR = resolve(fileURLToPath(new URL('..', import.meta.url)))
@@ -21,12 +22,28 @@ function readPositiveIntEnv(name, fallback) {
   return parsed
 }
 
+function readBooleanEnv(name, fallback) {
+  const raw = (process.env[name] || '').trim().toLowerCase()
+  if (!raw) return fallback
+
+  if (raw === '1' || raw === 'true' || raw === 'yes' || raw === 'on') return true
+  if (raw === '0' || raw === 'false' || raw === 'no' || raw === 'off') return false
+  return fallback
+}
+
 const MAX_BODY_SIZE = readPositiveIntEnv('MAX_BODY_SIZE', 100_000)
 const REQUEST_TIMEOUT_MS = readPositiveIntEnv('REQUEST_TIMEOUT_MS', 10_000)
 const RATE_LIMIT_WINDOW_MS = readPositiveIntEnv('RATE_LIMIT_WINDOW_MS', 10 * 60_000)
 const RATE_LIMIT_MAX_POSTS = readPositiveIntEnv('RATE_LIMIT_MAX_POSTS', 20)
 const PORT = readPositiveIntEnv('PORT', 3001)
 const ADMIN_API_TOKEN = (process.env.ADMIN_API_TOKEN || '').trim()
+const CONTACT_TO_EMAIL = (process.env.CONTACT_TO_EMAIL || 'mathis.lallemmand2@gmail.com').trim()
+const CONTACT_FROM_EMAIL = (process.env.CONTACT_FROM_EMAIL || process.env.SMTP_USER || '').trim()
+const SMTP_HOST = (process.env.SMTP_HOST || '').trim()
+const SMTP_PORT = readPositiveIntEnv('SMTP_PORT', 465)
+const SMTP_SECURE = readBooleanEnv('SMTP_SECURE', SMTP_PORT === 465)
+const SMTP_USER = (process.env.SMTP_USER || '').trim()
+const SMTP_PASS = (process.env.SMTP_PASS || '').trim()
 
 const JSON_HEADERS = { 'Content-Type': 'application/json; charset=utf-8' }
 const MIME_TYPES = {
@@ -56,6 +73,7 @@ const allowedCorsOrigins = new Set(
 const trustedOriginHosts = new Set(['mathislallemand.fr', 'www.mathislallemand.fr'])
 
 const postRateLimitStore = new Map()
+let contactTransporter = null
 const rateLimitSweepTimer = setInterval(() => {
   const now = Date.now()
   for (const [ip, entry] of postRateLimitStore.entries()) {
@@ -268,6 +286,141 @@ function enforcePostRateLimit(req, res) {
   return true
 }
 
+function stripControlChars(value, { keepNewLines = false } = {}) {
+  let output = ''
+
+  for (const char of value) {
+    const code = char.charCodeAt(0)
+    const isControl = (code >= 0 && code <= 31) || code === 127
+
+    if (!isControl) {
+      output += char
+      continue
+    }
+
+    if (keepNewLines && (char === '\n' || char === '\t')) {
+      output += char
+    }
+  }
+
+  return output
+}
+
+function sanitizeSingleLine(value, maxLength) {
+  return stripControlChars(String(value ?? '').normalize('NFKC').replace(/\r\n?/g, ' '))
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, maxLength)
+}
+
+function sanitizeMultiline(value, maxLength) {
+  return stripControlChars(String(value ?? '').normalize('NFKC').replace(/\r\n?/g, '\n'), {
+    keepNewLines: true,
+  })
+    .replace(/[ \t]{2,}/g, ' ')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+    .slice(0, maxLength)
+}
+
+function isValidEmailAddress(email) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)
+}
+
+function normalizeContactPayload(input) {
+  const name = sanitizeSingleLine(input?.name, 90)
+  const email = sanitizeSingleLine(input?.email, 160).toLowerCase()
+  const projectType = sanitizeSingleLine(input?.projectType, 90)
+  const budget = sanitizeSingleLine(input?.budget, 90)
+  const message = sanitizeMultiline(input?.message, 3_000)
+
+  if (!name || !email || !message || !isValidEmailAddress(email)) {
+    return null
+  }
+
+  return {
+    name,
+    email,
+    projectType: projectType || 'Non precise',
+    budget: budget || 'Non precise',
+    message,
+  }
+}
+
+function escapeHtml(value) {
+  return String(value)
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;')
+}
+
+function getContactTransporter() {
+  if (contactTransporter) {
+    return contactTransporter
+  }
+
+  if (!SMTP_HOST || !SMTP_USER || !SMTP_PASS || !CONTACT_FROM_EMAIL || !CONTACT_TO_EMAIL) {
+    return null
+  }
+
+  contactTransporter = nodemailer.createTransport({
+    host: SMTP_HOST,
+    port: SMTP_PORT,
+    secure: SMTP_SECURE,
+    auth: {
+      user: SMTP_USER,
+      pass: SMTP_PASS,
+    },
+  })
+
+  return contactTransporter
+}
+
+async function sendContactEmail(payload) {
+  const transporter = getContactTransporter()
+  if (!transporter) {
+    return { ok: false, reason: 'not_configured' }
+  }
+
+  const submittedAt = new Date().toISOString()
+  const subject = `[Site] Nouvelle demande de contact - ${payload.name}`
+  const text = [
+    'Nouvelle demande depuis le formulaire du site.',
+    '',
+    `Nom: ${payload.name}`,
+    `Email: ${payload.email}`,
+    `Type de projet: ${payload.projectType}`,
+    `Budget: ${payload.budget}`,
+    `Date: ${submittedAt}`,
+    '',
+    'Message:',
+    payload.message,
+  ].join('\n')
+  const html = `
+    <h2>Nouvelle demande depuis le formulaire du site</h2>
+    <p><strong>Nom:</strong> ${escapeHtml(payload.name)}</p>
+    <p><strong>Email:</strong> ${escapeHtml(payload.email)}</p>
+    <p><strong>Type de projet:</strong> ${escapeHtml(payload.projectType)}</p>
+    <p><strong>Budget:</strong> ${escapeHtml(payload.budget)}</p>
+    <p><strong>Date:</strong> ${escapeHtml(submittedAt)}</p>
+    <p><strong>Message:</strong></p>
+    <pre style="white-space: pre-wrap; font-family: inherit;">${escapeHtml(payload.message)}</pre>
+  `
+
+  await transporter.sendMail({
+    from: CONTACT_FROM_EMAIL,
+    to: CONTACT_TO_EMAIL,
+    replyTo: payload.email,
+    subject,
+    text,
+    html,
+  })
+
+  return { ok: true }
+}
+
 function resolveStaticFilePath(pathname) {
   let decodedPath = pathname
 
@@ -319,7 +472,8 @@ async function handleApi(req, res, store) {
   const reviewId = getReviewIdFromPath(pathname)
   const isReviewsCollectionRoute = pathname === '/api/reviews'
   const isReviewItemRoute = reviewId !== null
-  if (!isReviewsCollectionRoute && !isReviewItemRoute) return false
+  const isContactRoute = pathname === '/api/contact'
+  if (!isReviewsCollectionRoute && !isReviewItemRoute && !isContactRoute) return false
 
   if (!setApiCorsHeaders(req, res)) {
     sendJson(res, 403, { error: 'Origine non autorisee.' })
@@ -329,7 +483,9 @@ async function handleApi(req, res, store) {
   if (req.method === 'OPTIONS') {
     const allowMethods = isReviewsCollectionRoute
       ? 'GET,HEAD,POST,OPTIONS'
-      : 'PATCH,DELETE,OPTIONS'
+      : isReviewItemRoute
+        ? 'PATCH,DELETE,OPTIONS'
+        : 'POST,OPTIONS'
     res.setHeader('Allow', allowMethods)
     res.statusCode = 204
     res.end()
@@ -376,6 +532,48 @@ async function handleApi(req, res, store) {
     }
 
     sendJson(res, 201, { review: created })
+    return true
+  }
+
+  if (isContactRoute && req.method === 'POST') {
+    if (!hasJsonContentType(req)) {
+      sendJson(res, 415, { error: 'Content-Type application/json requis.' })
+      return true
+    }
+
+    if (!enforcePostRateLimit(req, res)) {
+      return true
+    }
+
+    const body = await readJsonBody(req)
+    if (body.error === 'payload_too_large') {
+      sendJson(res, 413, { error: 'Payload trop volumineux.' })
+      return true
+    }
+
+    if (body.error === 'invalid_json') {
+      sendJson(res, 400, { error: 'Corps JSON invalide.' })
+      return true
+    }
+
+    const normalizedContact = normalizeContactPayload(body.data)
+    if (!normalizedContact) {
+      sendJson(res, 400, { error: 'Donnees invalides.' })
+      return true
+    }
+
+    try {
+      const result = await sendContactEmail(normalizedContact)
+      if (!result.ok) {
+        sendJson(res, 503, { error: 'Service email non configure.' })
+        return true
+      }
+    } catch {
+      sendJson(res, 502, { error: "Impossible d'envoyer le message pour le moment." })
+      return true
+    }
+
+    sendJson(res, 201, { success: true })
     return true
   }
 
@@ -431,8 +629,10 @@ async function handleApi(req, res, store) {
 
   if (isReviewsCollectionRoute) {
     res.setHeader('Allow', 'GET,HEAD,POST,OPTIONS')
-  } else {
+  } else if (isReviewItemRoute) {
     res.setHeader('Allow', 'PATCH,DELETE,OPTIONS')
+  } else {
+    res.setHeader('Allow', 'POST,OPTIONS')
   }
   sendJson(res, 405, { error: 'Methode non autorisee.' })
   return true
@@ -519,6 +719,12 @@ function shutdown() {
     store.close()
   } catch {
     // ignore close errors during shutdown
+  }
+
+  try {
+    contactTransporter?.close?.()
+  } catch {
+    // ignore transporter close errors during shutdown
   }
 
   server.close(() => {
