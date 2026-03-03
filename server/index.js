@@ -52,6 +52,10 @@ const SMTP_USER = (process.env.SMTP_USER || '').trim()
 const SMTP_PASS = (process.env.SMTP_PASS || '').replace(/\s+/g, '').trim()
 
 const CONTACT_SEND_BUDGET_MS = Math.max(3_000, REQUEST_TIMEOUT_MS - 1_200)
+const CONTACT_HANDLER_TIMEOUT_MS = readPositiveIntEnv(
+  'CONTACT_HANDLER_TIMEOUT_MS',
+  Math.max(2_500, CONTACT_SEND_BUDGET_MS),
+)
 const CONTACT_SEND_ATTEMPTS = SMTP_FALLBACK_ENABLED ? 2 : 1
 const CONTACT_SMTP_TIMEOUT_MS = Math.min(
   CONTACT_SMTP_TIMEOUT_MS_RAW,
@@ -483,6 +487,27 @@ function isTransientSmtpConnectionError(error) {
   return code === 'ETIMEDOUT' || code === 'ECONNECTION' || code === 'ESOCKET'
 }
 
+async function withTimeout(promise, timeoutMs) {
+  let timeoutHandle = null
+
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timeoutHandle = setTimeout(() => {
+          const timeoutError = new Error('Operation timeout exceeded')
+          timeoutError.code = 'ETIMEDOUT'
+          reject(timeoutError)
+        }, timeoutMs)
+      }),
+    ])
+  } finally {
+    if (timeoutHandle) {
+      clearTimeout(timeoutHandle)
+    }
+  }
+}
+
 async function sendMailWithTimeout(transporter, mailPayload, timeoutMs) {
   let timeoutHandle = null
 
@@ -705,7 +730,7 @@ async function handleApi(req, res, store) {
     }
 
     try {
-      const result = await sendContactEmail(normalizedContact)
+      const result = await withTimeout(sendContactEmail(normalizedContact), CONTACT_HANDLER_TIMEOUT_MS)
       if (!result.ok) {
         if (result.reason === 'missing_env') {
           sendJson(res, 503, {
