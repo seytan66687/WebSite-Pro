@@ -45,6 +45,9 @@ const CONTACT_FROM_EMAIL = (process.env.CONTACT_FROM_EMAIL || process.env.SMTP_U
 const SMTP_HOST = (process.env.SMTP_HOST || '').trim()
 const SMTP_PORT = readPositiveIntEnv('SMTP_PORT', 465)
 const SMTP_SECURE = readBooleanEnv('SMTP_SECURE', SMTP_PORT === 465)
+const SMTP_FALLBACK_ENABLED = readBooleanEnv('SMTP_FALLBACK_ENABLED', true)
+const SMTP_FALLBACK_PORT = readPositiveIntEnv('SMTP_FALLBACK_PORT', SMTP_PORT === 465 ? 587 : 465)
+const SMTP_FALLBACK_SECURE = readBooleanEnv('SMTP_FALLBACK_SECURE', SMTP_FALLBACK_PORT === 465)
 const SMTP_USER = (process.env.SMTP_USER || '').trim()
 const SMTP_PASS = (process.env.SMTP_PASS || '').replace(/\s+/g, '').trim()
 
@@ -77,6 +80,7 @@ const trustedOriginHosts = new Set(['mathislallemand.fr', 'www.mathislallemand.f
 
 const postRateLimitStore = new Map()
 let contactTransporter = null
+let contactFallbackTransporter = null
 let nodemailerModulePromise = null
 const rateLimitSweepTimer = setInterval(() => {
   const now = Date.now()
@@ -432,6 +436,46 @@ async function getContactTransporter() {
   return { transporter: contactTransporter }
 }
 
+async function getContactFallbackTransporter() {
+  if (!SMTP_FALLBACK_ENABLED) {
+    return { transporter: null, reason: 'fallback_disabled' }
+  }
+
+  if (contactFallbackTransporter) {
+    return { transporter: contactFallbackTransporter }
+  }
+
+  const missingEnv = getMissingContactEnvVars()
+  if (missingEnv.length > 0) {
+    return { transporter: null, reason: 'missing_env', missingEnv }
+  }
+
+  const nodemailer = await loadNodemailerModule()
+  if (!nodemailer) {
+    return { transporter: null, reason: 'module_missing' }
+  }
+
+  contactFallbackTransporter = nodemailer.createTransport({
+    host: SMTP_HOST,
+    port: SMTP_FALLBACK_PORT,
+    secure: SMTP_FALLBACK_SECURE,
+    connectionTimeout: CONTACT_SMTP_TIMEOUT_MS,
+    greetingTimeout: CONTACT_SMTP_TIMEOUT_MS,
+    socketTimeout: CONTACT_SMTP_TIMEOUT_MS,
+    auth: {
+      user: SMTP_USER,
+      pass: SMTP_PASS,
+    },
+  })
+
+  return { transporter: contactFallbackTransporter }
+}
+
+function isTransientSmtpConnectionError(error) {
+  const code = error && typeof error === 'object' && 'code' in error ? String(error.code || '') : ''
+  return code === 'ETIMEDOUT' || code === 'ECONNECTION' || code === 'ESOCKET'
+}
+
 async function sendContactEmail(payload) {
   const setup = await getContactTransporter()
   const transporter = setup.transporter
@@ -464,14 +508,28 @@ async function sendContactEmail(payload) {
     <pre style="white-space: pre-wrap; font-family: inherit;">${escapeHtml(payload.message)}</pre>
   `
 
-  await transporter.sendMail({
+  const mailPayload = {
     from: CONTACT_FROM_EMAIL,
     to: CONTACT_TO_EMAIL,
     replyTo: payload.email,
     subject,
     text,
     html,
-  })
+  }
+
+  try {
+    await transporter.sendMail(mailPayload)
+  } catch (error) {
+    if (isTransientSmtpConnectionError(error)) {
+      const fallbackSetup = await getContactFallbackTransporter()
+      if (fallbackSetup.transporter) {
+        await fallbackSetup.transporter.sendMail(mailPayload)
+        return { ok: true }
+      }
+    }
+
+    throw error
+  }
 
   return { ok: true }
 }
@@ -822,6 +880,12 @@ function shutdown() {
     contactTransporter?.close?.()
   } catch {
     // ignore transporter close errors during shutdown
+  }
+
+  try {
+    contactFallbackTransporter?.close?.()
+  } catch {
+    // ignore fallback transporter close errors during shutdown
   }
 
   server.close(() => {
