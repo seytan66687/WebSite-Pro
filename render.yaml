@@ -11,6 +11,16 @@
         value: "22"
       - key: REVIEWS_DB_PATH
         value: /var/data/reviews.sqlite
+      - key: CORS_ORIGIN
+        value: https://website-pro.onrender.com
+      - key: MAX_BODY_SIZE
+        value: "100000"
+      - key: REQUEST_TIMEOUT_MS
+        value: "10000"
+      - key: RATE_LIMIT_WINDOW_MS
+        value: "600000"
+      - key: RATE_LIMIT_MAX_POSTS
+        value: "20"
     disk:
       name: reviews-data
       mountPath: /var/data
