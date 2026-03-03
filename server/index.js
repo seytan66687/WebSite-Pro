@@ -35,7 +35,7 @@ const REQUEST_TIMEOUT_MS = readPositiveIntEnv('REQUEST_TIMEOUT_MS', 10_000)
 const RATE_LIMIT_WINDOW_MS = readPositiveIntEnv('RATE_LIMIT_WINDOW_MS', 10 * 60_000)
 const RATE_LIMIT_MAX_POSTS = readPositiveIntEnv('RATE_LIMIT_MAX_POSTS', 20)
 const PORT = readPositiveIntEnv('PORT', 3001)
-const CONTACT_SMTP_TIMEOUT_MS = readPositiveIntEnv(
+const CONTACT_SMTP_TIMEOUT_MS_RAW = readPositiveIntEnv(
   'CONTACT_SMTP_TIMEOUT_MS',
   Math.max(3_000, REQUEST_TIMEOUT_MS - 1_500),
 )
@@ -50,6 +50,13 @@ const SMTP_FALLBACK_PORT = readPositiveIntEnv('SMTP_FALLBACK_PORT', SMTP_PORT ==
 const SMTP_FALLBACK_SECURE = readBooleanEnv('SMTP_FALLBACK_SECURE', SMTP_FALLBACK_PORT === 465)
 const SMTP_USER = (process.env.SMTP_USER || '').trim()
 const SMTP_PASS = (process.env.SMTP_PASS || '').replace(/\s+/g, '').trim()
+
+const CONTACT_SEND_BUDGET_MS = Math.max(3_000, REQUEST_TIMEOUT_MS - 1_200)
+const CONTACT_SEND_ATTEMPTS = SMTP_FALLBACK_ENABLED ? 2 : 1
+const CONTACT_SMTP_TIMEOUT_MS = Math.min(
+  CONTACT_SMTP_TIMEOUT_MS_RAW,
+  Math.max(1_500, Math.floor(CONTACT_SEND_BUDGET_MS / CONTACT_SEND_ATTEMPTS)),
+)
 
 const JSON_HEADERS = { 'Content-Type': 'application/json; charset=utf-8' }
 const MIME_TYPES = {
@@ -476,6 +483,27 @@ function isTransientSmtpConnectionError(error) {
   return code === 'ETIMEDOUT' || code === 'ECONNECTION' || code === 'ESOCKET'
 }
 
+async function sendMailWithTimeout(transporter, mailPayload, timeoutMs) {
+  let timeoutHandle = null
+
+  try {
+    await Promise.race([
+      transporter.sendMail(mailPayload),
+      new Promise((_, reject) => {
+        timeoutHandle = setTimeout(() => {
+          const timeoutError = new Error('SMTP timeout exceeded')
+          timeoutError.code = 'ETIMEDOUT'
+          reject(timeoutError)
+        }, timeoutMs)
+      }),
+    ])
+  } finally {
+    if (timeoutHandle) {
+      clearTimeout(timeoutHandle)
+    }
+  }
+}
+
 async function sendContactEmail(payload) {
   const setup = await getContactTransporter()
   const transporter = setup.transporter
@@ -518,12 +546,12 @@ async function sendContactEmail(payload) {
   }
 
   try {
-    await transporter.sendMail(mailPayload)
+    await sendMailWithTimeout(transporter, mailPayload, CONTACT_SMTP_TIMEOUT_MS)
   } catch (error) {
     if (isTransientSmtpConnectionError(error)) {
       const fallbackSetup = await getContactFallbackTransporter()
       if (fallbackSetup.transporter) {
-        await fallbackSetup.transporter.sendMail(mailPayload)
+        await sendMailWithTimeout(fallbackSetup.transporter, mailPayload, CONTACT_SMTP_TIMEOUT_MS)
         return { ok: true }
       }
     }
