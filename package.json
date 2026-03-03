@@ -2,7 +2,6 @@
   "name": "site-perso",
   "private": true,
   "version": "0.0.0",
-  "packageManager": "npm@1.22.22",
   "type": "module",
   "scripts": {
     "dev": "vite",
