@@ -200,7 +200,7 @@ async function readJsonBody(req) {
 }
 
 function getReviewIdFromPath(pathname) {
-  const match = pathname.match(/^\/api\/reviews\/(\d+)$/)
+  const match = pathname.match(/^\/api\/reviews\/(\d+)\/?$/)
   if (!match) return null
 
   const reviewId = Number(match[1])
@@ -498,7 +498,8 @@ async function sendFile(req, res, pathname) {
 }
 
 async function handleApi(req, res, store) {
-  const pathname = new URL(req.url || '/', 'http://localhost').pathname
+  const rawPathname = new URL(req.url || '/', 'http://localhost').pathname
+  const pathname = rawPathname === '/' ? rawPathname : rawPathname.replace(/\/+$/, '')
   const reviewId = getReviewIdFromPath(pathname)
   const isReviewsCollectionRoute = pathname === '/api/reviews'
   const isReviewItemRoute = reviewId !== null
@@ -727,6 +728,14 @@ const store = createReviewsStore()
 
 const server = createServer(async (req, res) => {
   setSecurityHeaders(res)
+
+  const pathname = new URL(req.url || '/', 'http://localhost').pathname
+  if (pathname.startsWith('/api')) {
+    if (!setApiCorsHeaders(req, res)) {
+      sendJson(res, 403, { error: 'Origine non autorisee.' })
+      return
+    }
+  }
 
   req.setTimeout(REQUEST_TIMEOUT_MS, () => {
     if (!res.headersSent) {
