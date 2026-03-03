@@ -50,6 +50,10 @@ const SMTP_FALLBACK_PORT = readPositiveIntEnv('SMTP_FALLBACK_PORT', SMTP_PORT ==
 const SMTP_FALLBACK_SECURE = readBooleanEnv('SMTP_FALLBACK_SECURE', SMTP_FALLBACK_PORT === 465)
 const SMTP_USER = (process.env.SMTP_USER || '').trim()
 const SMTP_PASS = (process.env.SMTP_PASS || '').replace(/\s+/g, '').trim()
+const EMAIL_TRANSPORT = (process.env.EMAIL_TRANSPORT || 'auto').trim().toLowerCase()
+const RESEND_API_KEY = (process.env.RESEND_API_KEY || '').trim()
+const RESEND_FROM_EMAIL = (process.env.RESEND_FROM_EMAIL || '').trim()
+const RESEND_API_URL = 'https://api.resend.com/emails'
 
 const CONTACT_SEND_BUDGET_MS = Math.max(3_000, REQUEST_TIMEOUT_MS - 1_200)
 const CONTACT_HANDLER_TIMEOUT_MS = readPositiveIntEnv(
@@ -416,6 +420,20 @@ function getMissingContactEnvVars() {
   return missing
 }
 
+function getMissingResendEnvVars() {
+  const missing = []
+  if (!RESEND_API_KEY) missing.push('RESEND_API_KEY')
+  if (!RESEND_FROM_EMAIL) missing.push('RESEND_FROM_EMAIL')
+  if (!CONTACT_TO_EMAIL) missing.push('CONTACT_TO_EMAIL')
+  return missing
+}
+
+function shouldUseResendTransport() {
+  if (EMAIL_TRANSPORT === 'resend') return true
+  if (EMAIL_TRANSPORT === 'smtp') return false
+  return Boolean(RESEND_API_KEY)
+}
+
 async function getContactTransporter() {
   if (contactTransporter) {
     return { transporter: contactTransporter }
@@ -530,12 +548,6 @@ async function sendMailWithTimeout(transporter, mailPayload, timeoutMs) {
 }
 
 async function sendContactEmail(payload) {
-  const setup = await getContactTransporter()
-  const transporter = setup.transporter
-  if (!transporter) {
-    return { ok: false, reason: setup.reason || 'not_configured', missingEnv: setup.missingEnv || [] }
-  }
-
   const submittedAt = new Date().toISOString()
   const subject = `[Site] Nouvelle demande de contact - ${payload.name}`
   const text = [
@@ -560,6 +572,50 @@ async function sendContactEmail(payload) {
     <p><strong>Message:</strong></p>
     <pre style="white-space: pre-wrap; font-family: inherit;">${escapeHtml(payload.message)}</pre>
   `
+
+  if (shouldUseResendTransport()) {
+    const missingResendEnv = getMissingResendEnvVars()
+    if (missingResendEnv.length > 0) {
+      return { ok: false, reason: 'missing_resend_env', missingEnv: missingResendEnv }
+    }
+
+    const resendResponse = await withTimeout(
+      fetch(RESEND_API_URL, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${RESEND_API_KEY}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          from: RESEND_FROM_EMAIL,
+          to: [CONTACT_TO_EMAIL],
+          reply_to: payload.email,
+          subject,
+          text,
+          html,
+        }),
+      }),
+      CONTACT_HANDLER_TIMEOUT_MS,
+    )
+
+    if (!resendResponse.ok) {
+      const raw = await resendResponse.text()
+      return {
+        ok: false,
+        reason: 'resend_error',
+        status: resendResponse.status,
+        detail: raw.slice(0, 500),
+      }
+    }
+
+    return { ok: true }
+  }
+
+  const setup = await getContactTransporter()
+  const transporter = setup.transporter
+  if (!transporter) {
+    return { ok: false, reason: setup.reason || 'not_configured', missingEnv: setup.missingEnv || [] }
+  }
 
   const mailPayload = {
     from: CONTACT_FROM_EMAIL,
@@ -732,6 +788,24 @@ async function handleApi(req, res, store) {
     try {
       const result = await withTimeout(sendContactEmail(normalizedContact), CONTACT_HANDLER_TIMEOUT_MS)
       if (!result.ok) {
+        if (result.reason === 'missing_resend_env') {
+          sendJson(res, 503, {
+            error: 'Service email non configure: variables Resend manquantes.',
+            code: 'missing_resend_env',
+            missingEnv: result.missingEnv,
+          })
+          return true
+        }
+
+        if (result.reason === 'resend_error') {
+          sendJson(res, 502, {
+            error: "Impossible d'envoyer le message pour le moment.",
+            code: 'resend_error',
+            status: result.status,
+          })
+          return true
+        }
+
         if (result.reason === 'missing_env') {
           sendJson(res, 503, {
             error: 'Service email non configure: variables manquantes.',
