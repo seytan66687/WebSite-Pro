@@ -1,3 +1,4 @@
+import { timingSafeEqual } from 'node:crypto'
 import { createReadStream } from 'node:fs'
 import { access, stat } from 'node:fs/promises'
 import { createServer } from 'node:http'
@@ -25,6 +26,7 @@ const REQUEST_TIMEOUT_MS = readPositiveIntEnv('REQUEST_TIMEOUT_MS', 10_000)
 const RATE_LIMIT_WINDOW_MS = readPositiveIntEnv('RATE_LIMIT_WINDOW_MS', 10 * 60_000)
 const RATE_LIMIT_MAX_POSTS = readPositiveIntEnv('RATE_LIMIT_MAX_POSTS', 20)
 const PORT = readPositiveIntEnv('PORT', 3001)
+const ADMIN_API_TOKEN = (process.env.ADMIN_API_TOKEN || '').trim()
 
 const JSON_HEADERS = { 'Content-Type': 'application/json; charset=utf-8' }
 const MIME_TYPES = {
@@ -138,8 +140,8 @@ function setApiCorsHeaders(req, res) {
     return false
   }
 
-  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS')
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type')
+  res.setHeader('Access-Control-Allow-Methods', 'GET,HEAD,POST,PATCH,DELETE,OPTIONS')
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Admin-Token, Authorization')
   res.setHeader('Access-Control-Max-Age', '600')
   return true
 }
@@ -177,6 +179,56 @@ async function readJsonBody(req) {
   } catch {
     return { error: 'invalid_json' }
   }
+}
+
+function getReviewIdFromPath(pathname) {
+  const match = pathname.match(/^\/api\/reviews\/(\d+)$/)
+  if (!match) return null
+
+  const reviewId = Number(match[1])
+  if (!Number.isInteger(reviewId) || reviewId <= 0) return null
+  return reviewId
+}
+
+function getAdminTokenFromRequest(req) {
+  const headerToken =
+    typeof req.headers['x-admin-token'] === 'string' ? req.headers['x-admin-token'].trim() : ''
+  if (headerToken) return headerToken
+
+  const authorization = typeof req.headers.authorization === 'string' ? req.headers.authorization : ''
+  if (authorization.toLowerCase().startsWith('bearer ')) {
+    return authorization.slice(7).trim()
+  }
+
+  return ''
+}
+
+function isValidAdminToken(providedToken) {
+  if (!ADMIN_API_TOKEN || !providedToken) return false
+
+  const expectedBuffer = Buffer.from(ADMIN_API_TOKEN)
+  const providedBuffer = Buffer.from(providedToken)
+
+  if (expectedBuffer.length !== providedBuffer.length) {
+    return false
+  }
+
+  return timingSafeEqual(expectedBuffer, providedBuffer)
+}
+
+function requireAdminAccess(req, res) {
+  if (!ADMIN_API_TOKEN) {
+    sendJson(res, 503, { error: 'Token admin non configure.' })
+    return false
+  }
+
+  const providedToken = getAdminTokenFromRequest(req)
+  if (!isValidAdminToken(providedToken)) {
+    sendJson(res, 401, { error: 'Acces admin refuse.' })
+    return false
+  }
+
+  return true
 }
 
 function getClientIp(req) {
@@ -264,7 +316,10 @@ async function sendFile(req, res, pathname) {
 
 async function handleApi(req, res, store) {
   const pathname = new URL(req.url || '/', 'http://localhost').pathname
-  if (pathname !== '/api/reviews') return false
+  const reviewId = getReviewIdFromPath(pathname)
+  const isReviewsCollectionRoute = pathname === '/api/reviews'
+  const isReviewItemRoute = reviewId !== null
+  if (!isReviewsCollectionRoute && !isReviewItemRoute) return false
 
   if (!setApiCorsHeaders(req, res)) {
     sendJson(res, 403, { error: 'Origine non autorisee.' })
@@ -272,24 +327,28 @@ async function handleApi(req, res, store) {
   }
 
   if (req.method === 'OPTIONS') {
+    const allowMethods = isReviewsCollectionRoute
+      ? 'GET,HEAD,POST,OPTIONS'
+      : 'PATCH,DELETE,OPTIONS'
+    res.setHeader('Allow', allowMethods)
     res.statusCode = 204
     res.end()
     return true
   }
 
-  if (req.method === 'HEAD') {
+  if (isReviewsCollectionRoute && req.method === 'HEAD') {
     res.statusCode = 200
     res.setHeader('Content-Type', 'application/json; charset=utf-8')
     res.end()
     return true
   }
 
-  if (req.method === 'GET') {
+  if (isReviewsCollectionRoute && req.method === 'GET') {
     sendJson(res, 200, { reviews: store.list() })
     return true
   }
 
-  if (req.method === 'POST') {
+  if (isReviewsCollectionRoute && req.method === 'POST') {
     if (!hasJsonContentType(req)) {
       sendJson(res, 415, { error: 'Content-Type application/json requis.' })
       return true
@@ -320,7 +379,61 @@ async function handleApi(req, res, store) {
     return true
   }
 
-  res.setHeader('Allow', 'GET,HEAD,POST,OPTIONS')
+  if (isReviewItemRoute && req.method === 'PATCH') {
+    if (!requireAdminAccess(req, res)) {
+      return true
+    }
+
+    if (!hasJsonContentType(req)) {
+      sendJson(res, 415, { error: 'Content-Type application/json requis.' })
+      return true
+    }
+
+    const body = await readJsonBody(req)
+    if (body.error === 'payload_too_large') {
+      sendJson(res, 413, { error: 'Payload trop volumineux.' })
+      return true
+    }
+
+    if (body.error === 'invalid_json') {
+      sendJson(res, 400, { error: 'Corps JSON invalide.' })
+      return true
+    }
+
+    const updated = store.update(reviewId, body.data)
+    if (updated === null) {
+      sendJson(res, 404, { error: 'Avis introuvable.' })
+      return true
+    }
+    if (updated === false) {
+      sendJson(res, 400, { error: 'Donnees invalides.' })
+      return true
+    }
+
+    sendJson(res, 200, { review: updated })
+    return true
+  }
+
+  if (isReviewItemRoute && req.method === 'DELETE') {
+    if (!requireAdminAccess(req, res)) {
+      return true
+    }
+
+    const deleted = store.remove(reviewId)
+    if (!deleted) {
+      sendJson(res, 404, { error: 'Avis introuvable.' })
+      return true
+    }
+
+    sendJson(res, 200, { success: true })
+    return true
+  }
+
+  if (isReviewsCollectionRoute) {
+    res.setHeader('Allow', 'GET,HEAD,POST,OPTIONS')
+  } else {
+    res.setHeader('Allow', 'PATCH,DELETE,OPTIONS')
+  }
   sendJson(res, 405, { error: 'Methode non autorisee.' })
   return true
 }

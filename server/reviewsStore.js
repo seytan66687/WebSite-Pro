@@ -105,7 +105,10 @@ export function createReviewsStore() {
   const db = createDb()
 
   const selectStmt = db.prepare('SELECT id, payload, created_at FROM reviews ORDER BY id DESC LIMIT 200')
+  const selectByIdStmt = db.prepare('SELECT id, payload, created_at FROM reviews WHERE id = ?')
   const insertStmt = db.prepare('INSERT INTO reviews (payload, created_at) VALUES (?, ?)')
+  const updateStmt = db.prepare('UPDATE reviews SET payload = ? WHERE id = ?')
+  const deleteStmt = db.prepare('DELETE FROM reviews WHERE id = ?')
 
   return {
     list() {
@@ -122,6 +125,40 @@ export function createReviewsStore() {
         ...normalized,
         createdAt,
       }
+    },
+    update(id, input) {
+      const numericId = Number(id)
+      if (!Number.isInteger(numericId) || numericId <= 0) return null
+
+      const row = selectByIdStmt.get(numericId)
+      if (!row) return null
+
+      const current = toRowReview(row)
+      if (!current) return null
+
+      const mergedInput = {
+        name: input?.name ?? current.name,
+        role: input?.role ?? current.role,
+        text: input?.text ?? current.text,
+        rating: input?.rating ?? current.rating,
+      }
+      const normalized = normalizeReview(mergedInput)
+      if (!normalized) return false
+
+      updateStmt.run(JSON.stringify(normalized), numericId)
+
+      return {
+        id: numericId,
+        ...normalized,
+        createdAt: current.createdAt,
+      }
+    },
+    remove(id) {
+      const numericId = Number(id)
+      if (!Number.isInteger(numericId) || numericId <= 0) return false
+
+      const result = deleteStmt.run(numericId)
+      return Number(result.changes) > 0
     },
     close() {
       db.close()
