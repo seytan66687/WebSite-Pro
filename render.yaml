@@ -3,7 +3,7 @@
     name: site-perso
     runtime: node
     plan: free
-    buildCommand: npm ci --include=dev && npm run build
+    buildCommand: npm ci --include=dev && npm ls nodemailer && npm run build
     startCommand: npm run start
     autoDeploy: true
     envVars:
@@ -21,6 +21,20 @@
         value: "600000"
       - key: RATE_LIMIT_MAX_POSTS
         value: "20"
+      - key: CONTACT_TO_EMAIL
+        value: mathis.lallemmand2@gmail.com
+      - key: CONTACT_FROM_EMAIL
+        sync: false
+      - key: SMTP_HOST
+        sync: false
+      - key: SMTP_PORT
+        value: "465"
+      - key: SMTP_SECURE
+        value: "true"
+      - key: SMTP_USER
+        sync: false
+      - key: SMTP_PASS
+        sync: false
     disk:
       name: reviews-data
       mountPath: /var/data
