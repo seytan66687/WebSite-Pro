@@ -1,13 +1,29 @@
 import { timingSafeEqual } from 'node:crypto'
 import { createReadStream } from 'node:fs'
-import { access, stat } from 'node:fs/promises'
+import { access, appendFile, mkdir, stat } from 'node:fs/promises'
 import { createServer } from 'node:http'
-import { extname, join, posix, resolve, sep } from 'node:path'
+import { dirname, extname, join, posix, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createReviewsStore } from './reviewsStore.js'
 
 const ROOT_DIR = resolve(fileURLToPath(new URL('..', import.meta.url)))
 const DIST_DIR = resolve(ROOT_DIR, 'dist')
+const REVIEWS_DB_PATH = (process.env.REVIEWS_DB_PATH || '').trim()
+const CONTACT_BACKUP_PATH = (process.env.CONTACT_BACKUP_PATH || '').trim()
+
+function resolveContactBackupFilePath() {
+  if (CONTACT_BACKUP_PATH) {
+    return resolve(CONTACT_BACKUP_PATH)
+  }
+
+  if (REVIEWS_DB_PATH) {
+    return resolve(dirname(resolve(REVIEWS_DB_PATH)), 'failed-contact-requests.ndjson')
+  }
+
+  return resolve(ROOT_DIR, 'data', 'failed-contact-requests.ndjson')
+}
+
+const CONTACT_BACKUP_FILE_PATH = resolveContactBackupFilePath()
 
 function readPositiveIntEnv(name, fallback) {
   const raw = process.env[name]
@@ -505,6 +521,17 @@ function isTransientSmtpConnectionError(error) {
   return code === 'ETIMEDOUT' || code === 'ECONNECTION' || code === 'ESOCKET'
 }
 
+function getErrorCode(error) {
+  if (!error || typeof error !== 'object' || !('code' in error)) return ''
+  return String(error.code || '')
+}
+
+function getErrorResponseCode(error) {
+  if (!error || typeof error !== 'object' || !('responseCode' in error)) return null
+  const responseCode = Number(error.responseCode)
+  return Number.isFinite(responseCode) ? responseCode : null
+}
+
 async function withTimeout(promise, timeoutMs) {
   let timeoutHandle = null
 
@@ -641,6 +668,18 @@ async function sendContactEmail(payload) {
   }
 
   return { ok: true }
+}
+
+async function persistFailedContactRequest(payload, context = {}) {
+  await mkdir(dirname(CONTACT_BACKUP_FILE_PATH), { recursive: true })
+
+  const entry = {
+    storedAt: new Date().toISOString(),
+    payload,
+    context,
+  }
+
+  await appendFile(CONTACT_BACKUP_FILE_PATH, `${JSON.stringify(entry)}\n`, 'utf8')
 }
 
 function resolveStaticFilePath(pathname) {
@@ -785,9 +824,33 @@ async function handleApi(req, res, store) {
       return true
     }
 
+    const queueFailedContactAndRespond = async (context) => {
+      try {
+        await persistFailedContactRequest(normalizedContact, context)
+        sendJson(res, 201, { success: true, queued: true })
+        return true
+      } catch (persistError) {
+        console.error('Failed to persist queued contact request', {
+          persistErrorCode: getErrorCode(persistError) || 'persist_error',
+          backupPath: CONTACT_BACKUP_FILE_PATH,
+        })
+        return false
+      }
+    }
+
     try {
       const result = await withTimeout(sendContactEmail(normalizedContact), CONTACT_HANDLER_TIMEOUT_MS)
       if (!result.ok) {
+        const queued = await queueFailedContactAndRespond({
+          reason: result.reason || 'delivery_failed',
+          missingEnv: Array.isArray(result.missingEnv) ? result.missingEnv : [],
+          status: Number.isFinite(result.status) ? result.status : undefined,
+          detail: typeof result.detail === 'string' ? result.detail.slice(0, 500) : undefined,
+        })
+        if (queued) {
+          return true
+        }
+
         if (result.reason === 'missing_resend_env') {
           sendJson(res, 503, {
             error: 'Service email non configure: variables Resend manquantes.',
@@ -827,22 +890,27 @@ async function handleApi(req, res, store) {
         return true
       }
     } catch (error) {
-      const errorCode =
-        error && typeof error === 'object' && 'code' in error ? String(error.code || '') : ''
-      const smtpResponseCode =
-        error && typeof error === 'object' && 'responseCode' in error
-          ? Number(error.responseCode)
-          : null
+      const errorCode = getErrorCode(error)
+      const smtpResponseCode = getErrorResponseCode(error)
 
       console.error('Contact email send failed', {
         errorCode,
-        smtpResponseCode: Number.isFinite(smtpResponseCode) ? smtpResponseCode : null,
+        smtpResponseCode,
       })
+
+      const queued = await queueFailedContactAndRespond({
+        reason: 'delivery_exception',
+        errorCode: errorCode || 'smtp_error',
+        smtpResponseCode: smtpResponseCode ?? undefined,
+      })
+      if (queued) {
+        return true
+      }
 
       sendJson(res, 502, {
         error: "Impossible d'envoyer le message pour le moment.",
         code: errorCode || 'smtp_error',
-        smtpResponseCode: Number.isFinite(smtpResponseCode) ? smtpResponseCode : undefined,
+        smtpResponseCode: smtpResponseCode ?? undefined,
       })
       return true
     }
