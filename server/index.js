@@ -155,7 +155,20 @@ function setApiCorsHeaders(req, res) {
     res.setHeader('Access-Control-Allow-Origin', origin)
     appendVaryHeader(res, 'Origin')
   } else {
-    return false
+    let parsedOrigin = null
+    try {
+      parsedOrigin = new URL(origin)
+    } catch {
+      return false
+    }
+
+    // Fallback permissif: autorise toute origine HTTPS.
+    if (parsedOrigin.protocol !== 'https:') {
+      return false
+    }
+
+    res.setHeader('Access-Control-Allow-Origin', origin)
+    appendVaryHeader(res, 'Origin')
   }
 
   res.setHeader('Access-Control-Allow-Methods', 'GET,HEAD,POST,PATCH,DELETE,OPTIONS')
